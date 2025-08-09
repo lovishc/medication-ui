@@ -15,14 +15,15 @@ const { parser } = require('stream-json');
 const { streamArray } = require('stream-json/streamers/StreamArray');
 const { pick } = require('stream-json/filters/Pick');
 
-// Input paths
-const RAW_DIR = path.join(__dirname, 'rawData');
+// Input paths (resolve from project root)
+const ROOT_DIR = path.join(__dirname, '..');
+const RAW_DIR = path.join(ROOT_DIR, 'rawData');
 const MEDICAID_CSV = path.join(RAW_DIR, 'nadac-national-average-drug-acquisition-cst-medicaid.csv');
 const OPENFDA_JSON = path.join(RAW_DIR, 'drug-ndc-openfda.json');
 // const ORANGE_TXT = path.join(RAW_DIR, 'products.txt'); // no longer used
 
 // Output paths (public)
-const PUBLIC_DATA_DIR = path.join(__dirname, 'public', 'data');
+const PUBLIC_DATA_DIR = path.join(ROOT_DIR, 'public', 'data');
 if (!fs.existsSync(PUBLIC_DATA_DIR)) fs.mkdirSync(PUBLIC_DATA_DIR, { recursive: true });
 const OUT_ENRICHED_PUBLIC = path.join(PUBLIC_DATA_DIR, 'enriched_medicaid_openfda.json');
 const OUT_SEARCH_INDEX_PUBLIC = path.join(PUBLIC_DATA_DIR, 'search-index-enriched.json');

@@ -17,9 +17,9 @@
     "build": "react-scripts build",
     "test": "react-scripts test",
     "eject": "react-scripts eject",
-    "process:raw": "node raw-process.js",
+    "process:raw": "node scripts/raw-process.js",
     "fetch:sources": "node scripts/fetch-sources.js",
-    "fetch-and-build": "node scripts/fetch-sources.js && node raw-process.js && npm run build"
+    "setup": "node scripts/fetch-sources.js && node scripts/raw-process.js && npm run build"
   },
   "browserslist": {
     "production": [
