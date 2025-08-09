@@ -1,10 +1,9 @@
-import React, { useState, useEffect, useMemo, useCallback } from 'react';
+import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import './App.css';
 
 function App() {
   const [searchTerm, setSearchTerm] = useState('');
   const [selectedMedicine, setSelectedMedicine] = useState(null);
-  const [suggestions, setSuggestions] = useState([]);
   const [showSuggestions, setShowSuggestions] = useState(false);
   const [matchedGenerics, setMatchedGenerics] = useState([]);
   const [loading, setLoading] = useState(false);
@@ -12,6 +11,10 @@ function App() {
   
   // Data states
   const [medicationsData, setMedicationsData] = useState([]);
+  const [enrichedManifest, setEnrichedManifest] = useState(null);
+  const [descClassMap, setDescClassMap] = useState({});
+  const chunkCacheRef = useRef(new Map()); // filename -> array (cached)
+  // openFDA not loaded at runtime; rely on enriched fdaMatches
   const [searchIndex, setSearchIndex] = useState({ descriptions: [] });
   const [dataLoaded, setDataLoaded] = useState(false);
 
@@ -19,27 +22,50 @@ function App() {
   useEffect(() => {
     const loadData = async () => {
       try {
-        console.log('Loading data...');
-        
-        // Load data files
-        const [medicationsResponse, indexResponse] = await Promise.all([
-          fetch('./data/medications.json'),
-          fetch('./data/search-index.json')
+        console.log('Loading enriched data...');
+        setLoading(true);
+        // Load enriched manifest, search index, and description-classification map
+        const [manifestRes, indexRes, classRes] = await Promise.all([
+          fetch('./data/enriched-chunks/chunks-manifest.json'),
+          fetch('./data/search-index-enriched.json'),
+          fetch('./data/description-classification.json')
         ]);
-
-        const medications = await medicationsResponse.json();
-        const index = await indexResponse.json();
-
-        setMedicationsData(medications);
-        setSearchIndex(index);
-        setDataLoaded(true);
-        
-        console.log('Data loaded successfully!');
-        console.log(`Medications: ${medications.length}`);
+        const [manifest, index, classMap] = await Promise.all([
+          manifestRes.json(),
+          indexRes.json(),
+          classRes.json()
+        ]);
         console.log(`Search index: ${index.descriptions.length} descriptions`);
+        console.log(`Enriched chunks: ${manifest.numberOfChunks}`);
+        setEnrichedManifest(manifest);
+        setSearchIndex(index);
+        setDescClassMap(classMap || {});
+
+        // Prefetch all enriched chunks on load in parallel and cache them
+        const fetchedArrays = await Promise.all(
+          (manifest.chunks || []).map(async (ch) => {
+            try {
+              const cached = chunkCacheRef.current.get(ch.filename);
+              if (cached) return cached;
+              const resp = await fetch(`./data/enriched-chunks/${ch.filename}`);
+              const arr = await resp.json();
+              chunkCacheRef.current.set(ch.filename, arr);
+              return arr;
+            } catch (e) {
+              console.error('Failed to load enriched chunk', ch.filename, e);
+              return [];
+            }
+          })
+        );
+        const all = fetchedArrays.flat();
+        setMedicationsData(all);
+
+        setDataLoaded(true);
+        setLoading(false);
         
       } catch (error) {
         console.error('Error loading data:', error);
+        setLoading(false);
         // Fallback to empty data
         setMedicationsData([]);
         setSearchIndex({ descriptions: [] });
@@ -63,19 +89,28 @@ function App() {
     return value;
   };
 
-  // Helper function to extract strength numbers and units from text
-  const extractStrengthInfo = useCallback((description) => {
-    if (!description) return { numbers: [], units: [] };
-    
-    // Match patterns like "10 MG", "2.5 ML", "100 MCG", etc.
-    const strengthPattern = /(\d+(?:\.\d+)?)\s*(MG|MCG|ML|GM|G|L|UNIT|UNITS?|%)/gi;
-    const matches = [...description.matchAll(strengthPattern)];
-    
-    const numbers = matches.map(match => parseFloat(match[1]));
-    const units = matches.map(match => match[2].toUpperCase());
-    
-    return { numbers, units };
+  // Best matcher from enriched file's FDA matches
+  const getBestMatcherFromEnriched = useCallback((med) => {
+    const m = Array.isArray(med.fdaMatches) ? med.fdaMatches : [];
+    if (m.length === 0) return null;
+    return m[0];
   }, []);
+
+  // No reverse index needed when searching enriched by brand/generic names
+
+  // Fast lookup for description classification to optimize filtering
+  const descriptionToClassification = useMemo(() => {
+    const map = new Map();
+    for (const med of medicationsData) {
+      const desc = med && med.ndc_description;
+      if (!desc) continue;
+      const key = desc.toLowerCase();
+      if (!map.has(key) && med.classification_for_rate_setting) {
+        map.set(key, med.classification_for_rate_setting);
+      }
+    }
+    return map;
+  }, [medicationsData]);
 
   // Filter suggestions based on search term and drug filter
   const filteredSuggestions = useMemo(() => {
@@ -88,43 +123,50 @@ function App() {
     // Apply drug filter
     if (drugFilter === 'branded') {
       // Show only branded drugs (classification_for_rate_setting = 'B')
-      suggestions = suggestions.filter(desc => {
-        const medicine = medicationsData.find(
-          med => med.ndc_description && 
-          med.ndc_description.toLowerCase() === desc.toLowerCase()
-        );
-        return medicine && medicine.classification_for_rate_setting === 'B';
-      });
+      suggestions = suggestions.filter(desc => (descClassMap[desc] || '').toUpperCase() === 'B');
     } else if (drugFilter === 'generic') {
       // Show only generic drugs (classification_for_rate_setting = 'G')
-      suggestions = suggestions.filter(desc => {
-        const medicine = medicationsData.find(
-          med => med.ndc_description && 
-          med.ndc_description.toLowerCase() === desc.toLowerCase()
-        );
-        return medicine && medicine.classification_for_rate_setting === 'G';
-      });
+      suggestions = suggestions.filter(desc => (descClassMap[desc] || '').toUpperCase() === 'G');
     }
     // If drugFilter === 'all', show all drugs (no additional filtering)
     
     return suggestions.slice(0, 10); // Limit to 10 suggestions
-  }, [searchTerm, searchIndex, medicationsData, dataLoaded, drugFilter]);
+  }, [searchTerm, searchIndex, dataLoaded, drugFilter, descriptionToClassification]);
 
   useEffect(() => {
-    setSuggestions(filteredSuggestions);
     setShowSuggestions(filteredSuggestions.length > 0 && searchTerm.length >= 2);
   }, [filteredSuggestions, searchTerm]);
 
   // Handle medicine selection
-  const handleMedicineSelect = useCallback((description) => {
+  const handleMedicineSelect = useCallback(async (description) => {
     if (!description) return;
     
     setLoading(true);
     setSearchTerm(description);
     setShowSuggestions(false);
     
+    // Load enriched chunks on demand into memory (first selection)
+    let dataRef = medicationsData;
+    if (enrichedManifest && dataRef.length === 0) {
+      const all = [];
+      for (const ch of enrichedManifest.chunks) {
+        try {
+          const cached = chunkCacheRef.current.get(ch.filename);
+          if (cached) {
+            all.push(...cached);
+            continue;
+          }
+          const resp = await fetch(`./data/enriched-chunks/${ch.filename}`);
+          const arr = await resp.json();
+          chunkCacheRef.current.set(ch.filename, arr);
+          all.push(...arr);
+        } catch (e) { console.error('Failed to load enriched chunk', ch.filename, e); }
+      }
+      setMedicationsData(all);
+      dataRef = all;
+    }
     // Find all medications with this exact description
-    const exactMatches = medicationsData.filter(med => med.ndc_description === description);
+    const exactMatches = dataRef.filter(med => med.ndc_description === description);
     
     if (exactMatches.length === 0) {
       setSelectedMedicine(null);
@@ -133,83 +175,109 @@ function App() {
       return;
     }
 
-    // Get the first medicine for details
-    const medicine = exactMatches.find(med => med.fda_product_id) || exactMatches[0];
-    setSelectedMedicine({
+    // Pick the first exact match that has a non-null best FDA matcher; fallback to the first
+    const preferred = exactMatches.find(m => Array.isArray(m.fdaMatches) && m.fdaMatches.length > 0) || exactMatches[0];
+    const medicine = preferred;
+    const bestMatcher = getBestMatcherFromEnriched(medicine);
+    const updatedMedicine = {
       ...medicine,
-      allMatches: exactMatches // Include all NDCs with this description
-    });
+      __bestMatcher: bestMatcher,
+      // also set a friendly title source
+      fda_nonproprietary_name: (bestMatcher && bestMatcher.genericName) ? bestMatcher.genericName : medicine.fda_nonproprietary_name,
+      allMatches: exactMatches
+    };
+    setSelectedMedicine(updatedMedicine);
 
-    // Extract strength info from selected medicine
-    const selectedStrength = extractStrengthInfo(description);
-
-    // Find FDA nonproprietary name
-    let fdaNonproprietaryName = null;
-    for (const match of exactMatches) {
-      if (!isNullOrEmpty(match.fda_nonproprietary_name)) {
-        fdaNonproprietaryName = match.fda_nonproprietary_name;
-        break;
-      }
-    }
-
-    console.log('Selected medicine FDA name:', fdaNonproprietaryName);
-
-    // If we found an FDA nonproprietary name, search for generics
-    if (fdaNonproprietaryName) {
-      const genericMatches = medicationsData.filter(med => {
-        // Must have generic classification
-        if (med.classification_for_rate_setting !== 'G') return false;
-        
-        // Must contain the FDA nonproprietary name (soft match)
-        const hasNonproprietaryMatch = 
-          !isNullOrEmpty(med.fda_nonproprietary_name) &&
-          med.fda_nonproprietary_name.toLowerCase().includes(fdaNonproprietaryName.toLowerCase());
-        
-        const hasDescriptionMatch = 
-          med.ndc_description.toLowerCase().includes(fdaNonproprietaryName.toLowerCase());
-        
-        if (!hasNonproprietaryMatch && !hasDescriptionMatch) return false;
-
-        // Check strength matching
-        const genericStrength = extractStrengthInfo(med.ndc_description);
-        
-        // Check if any strength numbers match
-        const hasMatchingStrength = selectedStrength.numbers.some(selectedNum =>
-          genericStrength.numbers.some(genericNum => Math.abs(selectedNum - genericNum) < 0.001)
-        );
-        
-        // Check if any units match
-        const hasMatchingUnit = selectedStrength.units.some(selectedUnit =>
-          genericStrength.units.some(genericUnit => 
-            selectedUnit.toLowerCase() === genericUnit.toLowerCase()
-          )
-        );
-
-        // Must have either matching strength or be a close match
-        return (hasMatchingStrength && hasMatchingUnit) || selectedStrength.numbers.length === 0;
-      });
-
-      // Remove duplicates based on NDC and labeler name combination
-      const uniqueGenerics = [];
-      const seen = new Set();
-
-      genericMatches.forEach(med => {
-        const key = `${med.ndc}-${med.labeler_name || 'unknown'}`;
-        if (!seen.has(key)) {
-          seen.add(key);
-          uniqueGenerics.push(med);
+    // Search enriched medicaid directly by fdaMatches brand/generic names (case-insensitive substring)
+    const searchKeys = new Set();
+    if (bestMatcher && bestMatcher.genericName) searchKeys.add(bestMatcher.genericName.toLowerCase());
+    if (bestMatcher && bestMatcher.brandName) searchKeys.add(bestMatcher.brandName.toLowerCase());
+    const out = [];
+    const seen = new Set();
+    for (const r of medicationsData) {
+      const ms = Array.isArray(r.fdaMatches) ? r.fdaMatches : [];
+      if (!ms.length) continue;
+      let ok = false;
+      for (const m of ms) {
+        const bn = (m.brandName || '').toLowerCase();
+        const gn = (m.genericName || '').toLowerCase();
+        for (const k of searchKeys) {
+          if (!k) continue;
+          if ((bn && bn.includes(k)) || (gn && gn.includes(k))) { ok = true; break; }
         }
-      });
-
-      console.log(`Found ${uniqueGenerics.length} matching generics for ${fdaNonproprietaryName}`);
-      setMatchedGenerics(uniqueGenerics);
-    } else {
-      console.log('No FDA nonproprietary name found');
-      setMatchedGenerics([]);
+        if (ok) break;
+      }
+      if (!ok) continue;
+      const key = `${r.ndc}|${r.ndc_description}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(r);
     }
+    // Exclude branded drugs from generic listing (classification_for_rate_setting === 'B')
+    let genericsOnly = out.filter(r => (r.classification_for_rate_setting || '').toUpperCase() !== 'B');
+
+    // Exclude the currently selected medicine using the same de-dup key (description + price + labeler)
+    const resolveLabeler = (rec) => {
+      const fm = Array.isArray(rec.fdaMatches) ? rec.fdaMatches : [];
+      const best = fm.length > 0 ? fm[0] : null;
+      return (rec.fda_labeler_name || rec.__matchLabelerName || (best && best.labelerName) || '').toString().trim();
+    };
+    const selectedLabeler = (updatedMedicine.fda_labeler_name || updatedMedicine.__matchLabelerName || (bestMatcher && bestMatcher.labelerName) || '').toString().trim();
+    const selectedPrice = (updatedMedicine.nadac_per_unit || '').toString().trim();
+    const selectedDesc = (updatedMedicine.ndc_description || '').toString().trim();
+    const selectedKey = `${selectedDesc.toLowerCase()}|${selectedPrice}|${selectedLabeler.toLowerCase()}`;
+    genericsOnly = genericsOnly.filter(rec => {
+      const labeler = resolveLabeler(rec);
+      const price = (rec.nadac_per_unit || '').toString().trim();
+      const desc = (rec.ndc_description || '').toString().trim();
+      const key = `${desc.toLowerCase()}|${price}|${labeler.toLowerCase()}`;
+      return key !== selectedKey;
+    });
+    // Make list unique by description + price + labeler
+    const seenKeySet = new Set();
+    const unique = [];
+    for (const r of genericsOnly) {
+      const fm = Array.isArray(r.fdaMatches) ? r.fdaMatches : [];
+      const best = fm.length > 0 ? fm[0] : null;
+      const labeler = (r.fda_labeler_name || r.__matchLabelerName || (best && best.labelerName) || '').toString().trim();
+      const price = (r.nadac_per_unit || '').toString().trim();
+      const desc = (r.ndc_description || '').toString().trim();
+      const key = `${desc.toLowerCase()}|${price}|${labeler.toLowerCase()}`;
+      if (seenKeySet.has(key)) continue;
+      seenKeySet.add(key);
+      unique.push(r);
+    }
+    // Relevancy sorting by dosage strength difference
+    const parseNumbers = (s) => {
+      const str = (s || '').toString();
+      const m = str.match(/\d+(?:\.\d+)?/g);
+      return m ? m.map(v => parseFloat(v)).filter(n => Number.isFinite(n)) : [];
+    };
+    const sumNumbers = (arr) => arr.reduce((acc, n) => acc + (Number.isFinite(n) ? n : 0), 0);
+    const sumFromMatcher = (m) => {
+      if (!m) return 0;
+      let nums = [];
+      if (Array.isArray(m.activeIngredientsDetailed)) {
+        for (const ai of m.activeIngredientsDetailed) {
+          nums = nums.concat(parseNumbers(ai && ai.strength));
+        }
+      }
+      if (nums.length === 0 && m.dosageStrength) nums = parseNumbers(m.dosageStrength);
+      return sumNumbers(nums);
+    };
+    const sumFromRecord = (r) => {
+      const fm = Array.isArray(r.fdaMatches) ? r.fdaMatches : [];
+      if (fm.length > 0) return sumFromMatcher(fm[0]);
+      return sumNumbers(parseNumbers(r.ndc_description));
+    };
+    const baseSum = bestMatcher ? sumFromMatcher(bestMatcher) : sumNumbers(parseNumbers(updatedMedicine.ndc_description));
+    const scored = unique.map(r => ({ rec: r, diff: Math.abs(sumFromRecord(r) - baseSum) }));
+    scored.sort((a, b) => a.diff - b.diff);
+    console.log(`Found ${out.length} matches; showing ${unique.length} unique generics after filtering, excluding selected, de-dup, and sorting by dosage diff`);
+    setMatchedGenerics(scored.map(s => s.rec));
 
     setLoading(false);
-  }, [medicationsData, extractStrengthInfo]);
+  }, [medicationsData, getBestMatcherFromEnriched]);
 
   const handleSearch = () => {
     if (!searchTerm.trim() || !dataLoaded) return;
@@ -277,19 +345,19 @@ function App() {
                 className={`switch-option ${drugFilter === 'branded' ? 'active' : ''}`}
                 onClick={() => setDrugFilter('branded')}
               >
-                Show Branded Drugs
+                Branded Drugs
               </button>
               <button
                 className={`switch-option ${drugFilter === 'generic' ? 'active' : ''}`}
                 onClick={() => setDrugFilter('generic')}
               >
-                Show Generic Drugs
+                Generic Drugs
               </button>
               <button
                 className={`switch-option ${drugFilter === 'all' ? 'active' : ''}`}
                 onClick={() => setDrugFilter('all')}
               >
-                Show All
+                All Drugs
               </button>
             </div>
           </div>
@@ -317,7 +385,7 @@ function App() {
             {/* Suggestions Dropdown */}
             {showSuggestions && (
               <div className="suggestions-dropdown">
-                {suggestions.map((suggestion, index) => (
+                {filteredSuggestions.map((suggestion, index) => (
                   <div 
                     key={index}
                     className="suggestion-item"
@@ -368,33 +436,37 @@ function App() {
                 </div>
               </div>
 
-              {selectedMedicine.fda_product_id ? (
+              {selectedMedicine.__bestMatcher ? (
                 <div className="detail-section">
                   <h3>FDA Information</h3>
                   <div className="detail-grid">
                     <div className="detail-item">
-                      <label>FDA Nonproprietary Name:</label>
-                      <span>{formatDisplayValue(selectedMedicine.fda_nonproprietary_name)}</span>
+                      <label>Generic Name:</label>
+                      <span>{formatDisplayValue(selectedMedicine.__bestMatcher.genericName)}</span>
                     </div>
                     <div className="detail-item">
-                      <label>Proprietary Name:</label>
-                      <span>{formatDisplayValue(selectedMedicine.fda_proprietary_name)}</span>
+                      <label>Brand Name:</label>
+                      <span>{formatDisplayValue(selectedMedicine.__bestMatcher.brandName)}</span>
                     </div>
                     <div className="detail-item">
                       <label>Dosage Form:</label>
-                      <span>{formatDisplayValue(selectedMedicine.fda_dosage_form_name)}</span>
+                      <span>{formatDisplayValue(selectedMedicine.__bestMatcher.dosageForm)}</span>
                     </div>
                     <div className="detail-item">
                       <label>Route:</label>
-                      <span>{formatDisplayValue(selectedMedicine.fda_route_name)}</span>
+                      <span>{formatDisplayValue((selectedMedicine.__bestMatcher.routes || []).join(', '))}</span>
                     </div>
                     <div className="detail-item">
                       <label>Labeler:</label>
-                      <span>{formatDisplayValue(selectedMedicine.fda_labeler_name)}</span>
+                      <span>{formatDisplayValue(selectedMedicine.__bestMatcher.labelerName)}</span>
                     </div>
                     <div className="detail-item">
-                      <label>Active Strength:</label>
-                      <span>{formatStrength(selectedMedicine.fda_active_numerator_strength, selectedMedicine.fda_active_ingred_unit)}</span>
+                      <label>Active Ingredients:</label>
+                      <span>{formatDisplayValue((selectedMedicine.__bestMatcher.activeIngredientsDetailed || []).map(ai => {
+                        const n = ai.name || '';
+                        const s = ai.strength || '';
+                        return (n && s) ? `${n} ${s}` : (n || s);
+                      }).filter(Boolean).join('; '))}</span>
                     </div>
                   </div>
                 </div>
@@ -428,16 +500,26 @@ function App() {
                       <span className="price">{formatPrice(drug.nadac_per_unit)}</span>
                       <span className="unit">per {drug.pricing_unit}</span>
                     </div>
+{/*                     {Array.isArray(drug.__matchSources) && drug.__matchSources.length > 0 && (
+                      <div className="match-badges">
+                        <small>Matched by: {drug.__matchSources.map((s, i) => `${s.source}:${s.generic}`).join(', ')}</small>
+                      </div>
+                    )} */}
                     <div className="classification">
                       <span className={`classification ${drug.classification_for_rate_setting}`}>
                         {drug.classification_for_rate_setting === 'G' ? 'Generic' : 'Brand'}
                       </span>
                     </div>
-                    {!isNullOrEmpty(drug.fda_labeler_name) && (
+                    {(() => {
+                      const fm = Array.isArray(drug.fdaMatches) ? drug.fdaMatches : [];
+                      const best = fm.length > 0 ? fm[0] : null;
+                      const labeler = drug.fda_labeler_name || drug.__matchLabelerName || (best && best.labelerName) || '';
+                      return !isNullOrEmpty(labeler) ? (
                       <div className="labeler-name">
-                        <strong>Labeler:</strong> {formatDisplayValue(drug.fda_labeler_name)}
+                          <strong>Labeler:</strong> {formatDisplayValue(labeler)}
                       </div>
-                    )}
+                      ) : null;
+                    })()}
                     {!isNullOrEmpty(drug.fda_active_numerator_strength) && (
                       <div className="strength-info">
                         <strong>Strength:</strong> {formatStrength(drug.fda_active_numerator_strength, drug.fda_active_ingred_unit)}

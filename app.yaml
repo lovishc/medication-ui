@@ -1,0 +1,22 @@
+runtime: nodejs20
+service: default
+
+handlers:
+  # Serve static files from the build directory
+  - url: /static
+    static_dir: build/static
+    secure: always
+
+  - url: /(.*\.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot))$
+    static_files: build/\1
+    upload: build/.*\.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot)$
+    secure: always
+
+  # Serve index.html for all other routes (SPA routing)
+  - url: /.*
+    static_files: build/index.html
+    upload: build/index.html
+    secure: always
+
+env_variables:
+  NODE_ENV: production
